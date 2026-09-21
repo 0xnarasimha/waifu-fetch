@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""waifu-fetch — a minimal, aesthetic fetch tool.
+
+Shows one of your lifetime-pinned waifus (as rendered by kitty's graphics
+protocol) above a tiny system summary. No fastfetch, no bloat, stdlib only.
+
+Pins live in ``~/.config/fastfetch/cache/booru-pin-*`` — put there by the
+"pin to terminal" button in the Quickshell booru panel, or by hand.
+
+Environment:
+    WAIFU_PIN_DIR     pin directory (default ~/.config/fastfetch/cache)
+    WAIFU_IMG_HEIGHT  image height in terminal rows (default 16)
+
+Exit status is always 0; failures degrade to text-only output.
+"""
+
+import getpass
+import os
+import platform
+import random
+import shutil
+import socket
+import subprocess
+import sys
+
+VERSION = "1.0.0"
+PIN_PREFIX = "booru-pin-"
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp")
+
+DEFAULT_PIN_DIR = os.path.join(os.path.expanduser("~"), ".config", "fastfetch", "cache")
+
+
+def _use_color() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+class Pal:
+    def __init__(self, on: bool):
+        r = "\033[0m" if on else ""
+        self.reset = r
+        self.bold = "\033[1m" if on else ""
+        self.dim = "\033[2m" if on else ""
+        self.accent = "\033[1;35m" if on else ""  # bright magenta
+        self.dots = [f"\033[{c}m●" for c in (31, 32, 33, 34, 35, 36, 37, 90)] if on else ["●"] * 8
+
+
+# ---------------------------------------------------------------- info
+
+def _os_name() -> str:
+    try:
+        with open("/etc/os-release", encoding="utf-8") as fh:
+            info = {}
+            for line in fh:
+                line = line.strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    info[k] = v.strip('"')
+        pretty = info.get("PRETTY_NAME", "")
+        if pretty:
+            return pretty.replace(" Linux", "", 1) if pretty.endswith("x86_64") else pretty
+        return info.get("NAME", "linux")
+    except OSError:
+        return platform.system()
+
+
+def _uptime() -> str:
+    try:
+        with open("/proc/uptime", encoding="utf-8") as fh:
+            secs = int(float(fh.read().split()[0]))
+    except (OSError, ValueError):
+        return "?"
+    days, secs = divmod(secs, 86400)
+    hours, secs = divmod(secs, 3600)
+    mins = secs // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m" if mins else f"{hours}h"
+    return f"{mins}m" if mins else "just now"
+
+
+def _memory() -> str:
+    try:
+        mem = {}
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":"):
+                    mem[parts[0][:-1]] = int(parts[1])
+        total = mem.get("MemTotal", 0) / 1024 / 1024
+        avail = mem.get("MemAvailable", 0) / 1024 / 1024
+        if not total:
+            return "?"
+        used = total - avail
+        pct = int(used / total * 100)
+        return f"{used:.1f} / {total:.1f} GiB ({pct}%)"
+    except (OSError, ValueError):
+        return "?"
+
+
+def _wm() -> str:
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "Hyprland"
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")[0]
+    if desktop:
+        return desktop[0].upper() + desktop[1:] if len(desktop) > 1 else desktop
+    if os.environ.get("SWAYSOCK"):
+        return "Sway"
+    return ""
+
+
+def _shell() -> str:
+    return os.path.basename(os.environ.get("SHELL", "sh"))
+
+
+def _user_host() -> str:
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = os.environ.get("USER", "user")
+    return f"{user}@{socket.gethostname().split('.')[0]}"
+
+
+def collect_info():
+    rows = [
+        ("os", _os_name()),
+        ("kernel", platform.release()),
+        ("uptime", _uptime()),
+        ("shell", _shell()),
+    ]
+    wm = _wm()
+    if wm:
+        rows.append(("wm", wm))
+    rows.append(("mem", _memory()))
+    return [(k, v) for k, v in rows if v]
+
+
+# ---------------------------------------------------------------- image
+
+def pick_pin(pin_dir: str):
+    try:
+        names = sorted(
+            n for n in os.listdir(pin_dir)
+            if n.startswith(PIN_PREFIX) and n.lower().endswith(IMG_EXTS)
+        )
+    except OSError:
+        return None
+    if not names:
+        return None
+    return os.path.join(pin_dir, random.choice(names))
+
+
+def in_kitty() -> bool:
+    term = os.environ.get("TERM", "")
+    return (
+        "kitty" in term
+        or os.environ.get("TERM_PROGRAM") == "kitty"
+        or "KITTY_WINDOW_ID" in os.environ
+    )
+
+
+def show_image(path: str, height_cells: int) -> bool:
+    """Render image via kitty's icat kitten. Returns True on success."""
+    kitty = shutil.which("kitty")
+    if not kitty:
+        return False
+    cols = shutil.get_terminal_size((80, 24)).columns
+    place_w = max(20, min(cols, 72))
+    try:
+        subprocess.run(
+            [kitty, "+kitten", "icat", "--align", "center",
+             "--place", f"{place_w}x{height_cells}@0x0",
+             "--scale-up", "--", path],
+            check=True,
+        )
+        return True
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+# ---------------------------------------------------------------- render
+
+def _visible_len(text: str) -> int:
+    out, esc = 0, False
+    for ch in text:
+        if ch == "\033":
+            esc = True
+        elif esc:
+            if ch == "m":
+                esc = False
+        else:
+            out += 1
+    return out
+
+
+def render(rows, pal: Pal) -> str:
+    key_w = max(len(k) for k, _ in rows) if rows else 0
+    body_w = max(
+        [_visible_len(f"{pal.accent}{pal.bold}{_user_host()}{pal.reset}")]
+        + [_visible_len(f"{pal.dim}{k:<{key_w}}{pal.reset}  {v}") for k, v in rows]
+        + [_visible_len(" ".join(pal.dots))],
+        default=0,
+    )
+    cols = shutil.get_terminal_size((80, 24)).columns
+    pad = max(0, (cols - body_w) // 2)
+    pre = " " * pad
+    lines = [f"{pre}{pal.accent}{pal.bold}{_user_host()}{pal.reset}", f"{pre}"]
+    for key, val in rows:
+        lines.append(f"{pre}{pal.dim}{key:<{key_w}}{pal.reset}  {val}")
+    lines.append(f"{pre}")
+    lines.append(f"{pre}{' '.join(pal.dots)}{pal.reset}")
+    return "\n".join(lines)
+
+
+def main(argv) -> int:
+    pin_dir = os.environ.get("WAIFU_PIN_DIR", DEFAULT_PIN_DIR)
+    try:
+        height = max(6, int(os.environ.get("WAIFU_IMG_HEIGHT", "16")))
+    except ValueError:
+        height = 16
+
+    image = None
+    text_only = False
+    args = list(argv[1:])
+    while args:
+        arg = args.pop(0)
+        if arg in ("-h", "--help"):
+            print(__doc__.strip())
+            print("\nusage: waifu-fetch [--image PATH] [--text-only] [--version]")
+            return 0
+        if arg == "--version":
+            print(f"waifu-fetch {VERSION}")
+            return 0
+        if arg in ("--text-only", "--no-image"):
+            text_only = True
+        elif arg in ("--image", "-i"):
+            if not args:
+                print("waifu-fetch: --image needs a path", file=sys.stderr)
+                return 0
+            image = args.pop(0)
+        else:
+            print(f"waifu-fetch: unknown option {arg} (see --help)", file=sys.stderr)
+            return 0
+
+    if not text_only and image is None:
+        image = pick_pin(pin_dir)
+    if not text_only and image and in_kitty() and os.path.isfile(image):
+        if show_image(image, height):
+            print()
+
+    pal = Pal(_use_color())
+    print(render(collect_info(), pal))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
