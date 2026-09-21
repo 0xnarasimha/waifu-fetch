@@ -1,9 +1,10 @@
 # waifu-fetch
 
 A minimal, aesthetic fetch tool. Shows one of your lifetime-pinned waifus
-(rendered with kitty's graphics protocol) above a tiny system summary.
+on the left with a tiny system summary on the right (kitty graphics
+protocol, measured cell geometry — text never overlaps the image).
 
-No fastfetch. No dependencies. Pure Python 3 stdlib.
+No fastfetch. Pure Python 3 stdlib (+ ImageMagick for image sizing).
 
 ```
 narasimha@cachyos

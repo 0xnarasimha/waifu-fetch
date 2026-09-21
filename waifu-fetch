@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """waifu-fetch — a minimal, aesthetic fetch tool.
 
-Shows one of your lifetime-pinned waifus (as rendered by kitty's graphics
-protocol) above a tiny system summary. No fastfetch, no bloat, stdlib only.
+Shows one of your lifetime-pinned waifus next to a tiny system summary.
+Image goes on the left (kitty graphics protocol), text on the right.
+No fastfetch, stdlib only (ImageMagick used for sizing when available).
 
 Pins live in ``~/.config/fastfetch/cache/booru-pin-*`` — put there by the
 "pin to terminal" button in the Quickshell booru panel, or by hand.
@@ -18,12 +19,14 @@ import getpass
 import os
 import platform
 import random
+import re
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PIN_PREFIX = "booru-pin-"
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp")
 
@@ -159,8 +162,109 @@ def in_kitty() -> bool:
     )
 
 
-def show_image(path: str, height_cells: int) -> bool:
-    """Render image via kitty's icat kitten. Returns True on success."""
+def _kitty_cell_size():
+    """Return (cell_w_px, cell_h_px) or None when it cannot be measured."""
+    kitty = shutil.which("kitty")
+    if not kitty:
+        return None
+    try:
+        proc = subprocess.run(
+            [kitty, "+kitten", "icat", "--print-window-size"],
+            capture_output=True, text=True, timeout=5,
+        )
+        match = re.search(r"(\d+)\s*x\s*(\d+)", proc.stdout or "")
+        if not match:
+            return None
+        win_w, win_h = int(match.group(1)), int(match.group(2))
+        size = shutil.get_terminal_size((80, 24))
+        if size.columns <= 0 or size.lines <= 0:
+            return None
+        return (win_w / size.columns, win_h / size.lines)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def _magick(*args):
+    try:
+        subprocess.run(["magick", *args], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        return True
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _identify_size(path: str):
+    """Return (w, h) in pixels via magick, or None."""
+    try:
+        proc = subprocess.run(
+            ["magick", "identify", "-format", "%w %h", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=15, check=True,
+        )
+        w, h = proc.stdout.strip().split()
+        return (int(w), int(h))
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def show_side_by_side(path: str, height_rows: int, lines) -> bool:
+    """Image left, text right. Needs kitty + magick. Returns True on success."""
+    if not shutil.which("kitty") or not shutil.which("magick"):
+        return False
+    cell = _kitty_cell_size()
+    if cell is None:
+        return False
+    cell_w, cell_h = cell
+
+    fd, thumb = tempfile.mkstemp(prefix="waifu-fetch-", suffix=".png")
+    os.close(fd)
+    try:
+        target_h = max(1, int(height_rows * cell_h))
+        if not _magick(path, "-resize", f"x{target_h}", "-strip", thumb):
+            return False
+        size = _identify_size(thumb)
+        if size is None:
+            return False
+        img_cols = max(8, round(size[0] / cell_w))
+        rows_used = max(1, round(size[1] / cell_h))
+
+        try:
+            subprocess.run(
+                ["kitty", "+kitten", "icat", "--align", "left", "--", thumb],
+                check=True,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return False
+
+        # Cursor now sits on the first row below the image. Paint each text
+        # line with absolute moves from that saved anchor — no drift.
+        gap = 4
+        out = ["\033[s"]
+        for i, line in enumerate(lines):
+            up = rows_used - i
+            seq = "\033[u"
+            if up > 0:
+                seq += f"\033[{up}A"
+            seq += f"\033[{img_cols + gap}C{line}"
+            out.append(seq)
+        drop = max(0, len(lines) - rows_used)
+        tail = "\033[u"
+        if drop > 0:
+            tail += f"\033[{drop}B"
+        tail += "\r"
+        out.append(tail)
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+        return True
+    finally:
+        try:
+            os.unlink(thumb)
+        except OSError:
+            pass
+
+
+def show_top_center(path: str, height_cells: int) -> bool:
+    """Fallback layout: image centered on top. Returns True on success."""
     kitty = shutil.which("kitty")
     if not kitty:
         return False
@@ -193,23 +297,22 @@ def _visible_len(text: str) -> int:
     return out
 
 
-def render(rows, pal: Pal) -> str:
+def build_lines(rows, pal: Pal):
     key_w = max(len(k) for k, _ in rows) if rows else 0
-    body_w = max(
-        [_visible_len(f"{pal.accent}{pal.bold}{_user_host()}{pal.reset}")]
-        + [_visible_len(f"{pal.dim}{k:<{key_w}}{pal.reset}  {v}") for k, v in rows]
-        + [_visible_len(" ".join(pal.dots))],
-        default=0,
-    )
-    cols = shutil.get_terminal_size((80, 24)).columns
-    pad = max(0, (cols - body_w) // 2)
-    pre = " " * pad
-    lines = [f"{pre}{pal.accent}{pal.bold}{_user_host()}{pal.reset}", f"{pre}"]
+    lines = [f"{pal.accent}{pal.bold}{_user_host()}{pal.reset}", ""]
     for key, val in rows:
-        lines.append(f"{pre}{pal.dim}{key:<{key_w}}{pal.reset}  {val}")
-    lines.append(f"{pre}")
-    lines.append(f"{pre}{' '.join(pal.dots)}{pal.reset}")
-    return "\n".join(lines)
+        lines.append(f"{pal.dim}{key:<{key_w}}{pal.reset}  {val}")
+    lines.append("")
+    lines.append(f"{' '.join(pal.dots)}{pal.reset}")
+    return lines
+
+
+def render_centered(rows, pal: Pal) -> str:
+    lines = build_lines(rows, pal)
+    body_w = max((_visible_len(l) for l in lines), default=0)
+    cols = shutil.get_terminal_size((80, 24)).columns
+    pre = " " * max(0, (cols - body_w) // 2)
+    return "\n".join(f"{pre}{l}" for l in lines)
 
 
 def main(argv) -> int:
@@ -244,12 +347,18 @@ def main(argv) -> int:
 
     if not text_only and image is None:
         image = pick_pin(pin_dir)
-    if not text_only and image and in_kitty() and os.path.isfile(image):
-        if show_image(image, height):
-            print()
 
     pal = Pal(_use_color())
-    print(render(collect_info(), pal))
+    rows = collect_info()
+
+    if not text_only and image and in_kitty() and os.path.isfile(image):
+        if show_side_by_side(image, height, build_lines(rows, pal)):
+            print()
+            return 0
+        if show_top_center(image, height):
+            print()
+
+    print(render_centered(rows, pal))
     return 0
 
 
